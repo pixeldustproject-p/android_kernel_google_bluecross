@@ -314,6 +314,7 @@ struct drv2624_data {
 	struct drv2624_fw_header fw_header;
 	unsigned char ram_lsb;
 	unsigned char ram_msb;
+	u8 level;
 };
 
 #define	DRV2624_MAGIC_NUMBER	0x32363234	/* '2624' */
