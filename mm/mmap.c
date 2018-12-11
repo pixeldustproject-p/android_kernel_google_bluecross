@@ -2785,7 +2785,7 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
  * work.  This now handles partial unmappings.
  * Jeremy Fitzhardinge <jeremy@goop.org>
  */
-static int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len, bool downgrade)
+int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len, bool downgrade)
 {
 	unsigned long end;
 	struct vm_area_struct *vma, *prev, *last;
@@ -2876,12 +2876,10 @@ static int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len, bo
 
 	return downgrade ? 1 : 0;
 }
-EXPORT_SYMBOL(do_munmap);
 
-int do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
-	      struct list_head *uf)
+int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
 {
-	return __do_munmap(mm, start, len, uf, false);
+	return __do_munmap(mm, start, len, false);
 }
 
 static int __vm_munmap(unsigned long start, size_t len, bool downgrade)
