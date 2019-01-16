@@ -65,6 +65,7 @@
 #include <linux/kthread.h>
 #include <linux/memcontrol.h>
 #include <linux/show_mem_notifier.h>
+#include <linux/random.h>
 
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
@@ -1074,6 +1075,13 @@ static __always_inline bool free_pages_prepare(struct page *page,
 		debug_check_no_obj_freed(page_address(page),
 					   PAGE_SIZE << order);
 	}
+
+	if (IS_ENABLED(CONFIG_PAGE_SANITIZE)) {
+		int i;
+		for (i = 0; i < (1 << order); i++)
+			clear_highpage(page + i);
+	}
+
 	arch_free_page(page, order);
 	kernel_poison_pages(page, 1 << order, 0);
 	kernel_map_pages(page, 1 << order, 0);
@@ -1288,6 +1296,16 @@ static void __free_pages_boot_core(struct page *page, unsigned int order)
 	}
 	__ClearPageReserved(p);
 	set_page_count(p, 0);
+
+	if (!PageHighMem(page) && page_to_pfn(page) < 0x100000) {
+		unsigned long hash = 0;
+		size_t index, end = PAGE_SIZE * nr_pages / sizeof hash;
+		const unsigned long *data = lowmem_page_address(page);
+
+		for (index = 0; index < end; index++)
+			hash ^= hash + data[index];
+		add_device_randomness((const void *)&hash, sizeof(hash));
+	}
 
 	page_zone(page)->managed_pages += nr_pages;
 	set_page_refcounted(page);
@@ -1783,7 +1801,12 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
 
 	post_alloc_hook(page, order, gfp_flags);
 
-	if (!free_pages_prezeroed() && (gfp_flags & __GFP_ZERO))
+	if (IS_ENABLED(CONFIG_PAGE_SANITIZE_VERIFY)) {
+		for (i = 0; i < (1 << order); i++)
+			verify_zero_highpage(page + i);
+	}
+
+	if ((!IS_ENABLED(CONFIG_PAGE_SANITIZE) && (!free_pages_prezeroed() && (gfp_flags & __GFP_ZERO))))
 		for (i = 0; i < (1 << order); i++)
 			clear_highpage(page + i);
 
