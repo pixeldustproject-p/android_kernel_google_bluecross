@@ -595,7 +595,7 @@ static void zram_page_end_io(struct bio *bio)
 {
 	struct page *page = bio->bi_io_vec[0].bv_page;
 
-	page_endio(page, bio_data_dir(bio), bio->bi_error);
+	page_endio(page, op_is_write(bio_op(bio)), bio->bi_error);
 	bio_put(bio);
 }
 
@@ -619,14 +619,14 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
 	}
 
 	if (!parent) {
-		bio->bi_rw = 0;
+		bio->bi_opf = REQ_OP_READ;
 		bio->bi_end_io = zram_page_end_io;
 	} else {
-		bio->bi_rw = parent->bi_rw;
+		bio->bi_opf = parent->bi_opf;
 		bio_chain(bio, parent);
 	}
 
-	submit_bio(READ, bio);
+	submit_bio(bio);
 	return 1;
 }
 
