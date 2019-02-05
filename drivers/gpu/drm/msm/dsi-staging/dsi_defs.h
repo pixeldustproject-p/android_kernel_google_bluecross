@@ -606,7 +606,6 @@ enum dsi_error_status {
 	DSI_FIFO_OVERFLOW = 1,
 	DSI_FIFO_UNDERFLOW,
 	DSI_LP_Rx_TIMEOUT,
-	DSI_ERR_INTR_ALL,
 };
 
 #endif /* _DSI_DEFS_H_ */
