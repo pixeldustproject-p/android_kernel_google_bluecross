@@ -865,9 +865,8 @@ static void sde_hw_sspp_setup_ts_prefill(struct sde_hw_pipe *ctx,
 	}
 
 	if (cfg->time) {
-		u64 temp = DIV_ROUND_UP_ULL(TS_CLK * 1000000ULL, cfg->time);
-
-		ts_bytes = temp * cfg->size;
+		ts_bytes = mult_frac(TS_CLK * 1000000ULL, cfg->size,
+				cfg->time);
 		if (ts_bytes > SSPP_TRAFFIC_SHAPER_BPC_MAX)
 			ts_bytes = SSPP_TRAFFIC_SHAPER_BPC_MAX;
 	}
