@@ -3361,6 +3361,7 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq, bool update_freq)
  */
 #define UPDATE_TG	0x1
 #define SKIP_AGE_LOAD	0x2
+#define SKIP_CPUFREQ	0x4
 
 /* Update task and its cfs_rq load average */
 static inline void update_load_avg(struct sched_entity *se, int flags)
@@ -3382,7 +3383,7 @@ static inline void update_load_avg(struct sched_entity *se, int flags)
 			  cfs_rq->curr == se, NULL);
 	}
 
-	decayed  = update_cfs_rq_load_avg(now, cfs_rq, true);
+	decayed  = update_cfs_rq_load_avg(now, cfs_rq, !(flags & SKIP_CPUFREQ));
 	decayed |= propagate_entity_load_avg(se);
 
 	if (decayed && (flags & UPDATE_TG))
@@ -3540,6 +3541,8 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq, bool update_freq)
 
 #define UPDATE_TG	0x0
 #define SKIP_AGE_LOAD	0x0
+#define SKIP_CPUFREQ	0x0
+#define SKIP_CPUFREQ	0x3
 
 static inline void update_load_avg(struct sched_entity *se, int not_used1)
 {
@@ -3765,6 +3768,8 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 static void
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
+	int update_flags;
+
 	/*
 	 * Update run-time statistics of the 'current'.
 	 */
@@ -3778,7 +3783,12 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 *   - For group entity, update its weight to reflect the new share
 	 *     of its group cfs_rq.
 	 */
-	update_load_avg(se, UPDATE_TG);
+	update_flags = UPDATE_TG;
+
+	if (flags & DEQUEUE_IDLE)
+		update_flags |= SKIP_CPUFREQ;
+
+	update_load_avg(se, update_flags);
 	dequeue_entity_load_avg(cfs_rq, se);
 
 	update_stats_dequeue(cfs_rq, se, flags);
@@ -4972,6 +4982,9 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_entity *se = &p->se;
 	int task_sleep = flags & DEQUEUE_SLEEP;
 
+	if (task_sleep && rq->nr_running == 1)
+		flags |= DEQUEUE_IDLE;
+
 #ifdef CONFIG_SMP
 	/*
 	 * Update SchedTune accounting
@@ -5014,6 +5027,8 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	for_each_sched_entity(se) {
+		int update_flags;
+
 		cfs_rq = cfs_rq_of(se);
 		cfs_rq->h_nr_running--;
 		walt_dec_cfs_rq_stats(cfs_rq, p);
@@ -5021,7 +5036,12 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		if (cfs_rq_throttled(cfs_rq))
 			break;
 
-		update_load_avg(se, UPDATE_TG);
+		update_flags = UPDATE_TG;
+
+		if (flags & DEQUEUE_IDLE)
+			update_flags |= SKIP_CPUFREQ;
+
+		update_load_avg(se, update_flags);
 		update_cfs_shares(se);
 	}
 
@@ -9591,7 +9611,22 @@ void fix_small_imbalance(struct lb_env *env, struct sd_lb_stats *sds)
 	capa_move /= SCHED_CAPACITY_SCALE;
 
 	/* Move if we gain throughput */
-	if (capa_move > capa_now)
+	if (capa_move > capa_now) {
+		env->imbalance = busiest->load_per_task;
+		return;
+	}
+
+	/* We can't see throughput improvement with the load-based
+	 * method, but it is possible depending upon group size and
+	 * capacity range that there might still be an underutilized
+	 * cpu available in an asymmetric capacity system. Do one last
+	 * check just in case.
+	 */
+	if (env->sd->flags & SD_ASYM_CPUCAPACITY &&
+		busiest->group_type == group_overloaded &&
+		busiest->sum_nr_running > busiest->group_weight &&
+		local->sum_nr_running < local->group_weight &&
+		local->group_capacity < busiest->group_capacity)
 		env->imbalance = busiest->load_per_task;
 }
 
@@ -9675,11 +9710,21 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
 		(sds->avg_load - local->avg_load) * local->group_capacity
 	) / SCHED_CAPACITY_SCALE;
 
-	/* Boost imbalance to allow misfit task to be balanced. */
-	if (busiest->group_type == group_misfit_task)
+	/* Boost imbalance to allow misfit task to be balanced.
+	 * Always do this if we are doing a NEWLY_IDLE balance
+	 * on the assumption that any tasks we have must not be
+	 * long-running (and hence we cannot rely upon load).
+	 * However if we are not idle, we should assume the tasks
+	 * we have are longer running and not override load-based
+	 * calculations above unless we are sure that the local
+	 * group is underutilized.
+	 */
+	if (busiest->group_type == group_misfit_task &&
+		(env->idle == CPU_NEWLY_IDLE ||
+		local->sum_nr_running < local->group_weight)) {
 		env->imbalance = max_t(long, env->imbalance,
 				     busiest->group_misfit_task);
-
+	}
 	/*
 	 * if *imbalance is less than the average load per runnable task
 	 * there is no guarantee that any tasks will be moved so we'll have

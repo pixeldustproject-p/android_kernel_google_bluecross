@@ -136,8 +136,7 @@ enum {
 	BINDER_DEBUG_PRIORITY_CAP           = 1U << 13,
 	BINDER_DEBUG_SPINLOCKS              = 1U << 14,
 };
-static uint32_t binder_debug_mask = BINDER_DEBUG_USER_ERROR |
-	BINDER_DEBUG_FAILED_TRANSACTION | BINDER_DEBUG_DEAD_TRANSACTION;
+static uint32_t binder_debug_mask = 0;
 module_param_named(debug_mask, binder_debug_mask, uint, 0644);
 
 static char *binder_devices_param = CONFIG_ANDROID_BINDER_DEVICES;
@@ -5509,6 +5508,9 @@ static void print_binder_proc(struct seq_file *m,
 	for (n = rb_first(&proc->nodes); n != NULL; n = rb_next(n)) {
 		struct binder_node *node = rb_entry(n, struct binder_node,
 						    rb_node);
+		if (!print_all && !node->has_async_transaction)
+			continue;
+
 		/*
 		 * take a temporary reference on the node so it
 		 * survives and isn't removed from the tree

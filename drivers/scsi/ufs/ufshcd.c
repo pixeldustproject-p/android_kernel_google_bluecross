@@ -1066,6 +1066,10 @@ static void ufshcd_print_host_state(struct ufs_hba *hba)
 					hba->sdev_ufs_device->model);
 		dev_err(hba->dev, " rev = %.4s\n",
 					hba->sdev_ufs_device->rev);
+		dev_err(hba->dev, " nutrs = %d\n",
+					hba->nutrs);
+		dev_err(hba->dev, " queue_depth = %u\n",
+					hba->sdev_ufs_device->queue_depth);
 	}
 	dev_err(hba->dev, "lrb in use=0x%lx, outstanding reqs=0x%lx tasks=0x%lx\n",
 		hba->lrb_in_use, hba->outstanding_reqs, hba->outstanding_tasks);
@@ -2563,7 +2567,19 @@ static void ufshcd_clk_scaling_update_busy(struct ufs_hba *hba)
 static inline
 int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
 {
-	int ret = 0;
+	if (hba->lrb[task_tag].cmd) {
+		u8 opcode = (u8)(*hba->lrb[task_tag].cmd->cmnd);
+
+		if (opcode == SECURITY_PROTOCOL_OUT && hba->security_in) {
+			hba->security_in--;
+		} else if (opcode == SECURITY_PROTOCOL_IN) {
+			if (hba->security_in) {
+				WARN_ON(1);
+				return -EINVAL;
+			}
+			hba->security_in++;
+		}
+	}
 
 	hba->lrb[task_tag].issue_time_stamp = ktime_get();
 	hba->lrb[task_tag].complete_time_stamp = ktime_set(0, 0);
@@ -2576,7 +2592,7 @@ int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
 			hba->lrb[task_tag].cmd ? "scsi_send" : "dev_cmd_send");
 	ufshcd_update_tag_stats(hba, task_tag);
 	update_io_stat(hba, task_tag, 1);
-	return ret;
+	return 0;
 }
 
 /**
@@ -3397,7 +3413,13 @@ static int ufshcd_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
 		ufshcd_vops_crypto_engine_cfg_end(hba, lrbp, cmd->request);
 		dev_err(hba->dev, "%s: failed sending command, %d\n",
 							__func__, err);
-		err = DID_ERROR;
+		if (err == -EINVAL) {
+			set_host_byte(cmd, DID_ERROR);
+			if (has_read_lock)
+				ufshcd_put_read_lock(hba);
+			cmd->scsi_done(cmd);
+			return 0;
+		}
 		goto out;
 	}
 
@@ -3596,6 +3618,7 @@ static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 	int tag;
 	struct completion wait;
 	unsigned long flags;
+	bool has_read_lock = false;
 
 	/*
 	 * May get invoked from shutdown and IOCTL contexts.
@@ -3603,8 +3626,10 @@ static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 	 * In error recovery context, it may come with lock acquired.
 	 */
 
-	if (!ufshcd_is_shutdown_ongoing(hba) && !ufshcd_eh_in_progress(hba))
+	if (!ufshcd_is_shutdown_ongoing(hba) && !ufshcd_eh_in_progress(hba)) {
 		down_read(&hba->lock);
+		has_read_lock = true;
+	}
 
 	/*
 	 * Get free slot, sleep if slots are unavailable.
@@ -3637,7 +3662,7 @@ static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 out_put_tag:
 	ufshcd_put_dev_cmd_tag(hba, tag);
 	wake_up(&hba->dev_cmd.tag_wq);
-	if (!ufshcd_is_shutdown_ongoing(hba) && !ufshcd_eh_in_progress(hba))
+	if (has_read_lock)
 		up_read(&hba->lock);
 	return err;
 }
@@ -5487,6 +5512,7 @@ static void ufshcd_set_queue_depth(struct scsi_device *sdev)
 	int ret = 0;
 	u8 lun_qdepth;
 	struct ufs_hba *hba;
+	bool fixable_qdepth = false;
 
 	hba = shost_priv(sdev->host);
 
@@ -5498,17 +5524,23 @@ static void ufshcd_set_queue_depth(struct scsi_device *sdev)
 			  sizeof(lun_qdepth));
 
 	/* Some WLUN doesn't support unit descriptor */
-	if (ret == -EOPNOTSUPP)
+	if (ret == -EOPNOTSUPP ||
+		(sdev->lun ==
+			ufshcd_upiu_wlun_to_scsi_wlun(UFS_UPIU_RPMB_WLUN))) {
 		lun_qdepth = 1;
-	else if (!lun_qdepth)
+	} else if (!lun_qdepth) {
 		/* eventually, we can figure out the real queue depth */
 		lun_qdepth = hba->nutrs;
-	else
+		fixable_qdepth = true;
+	} else {
 		lun_qdepth = min_t(int, lun_qdepth, hba->nutrs);
+	}
 
-	dev_dbg(hba->dev, "%s: activate tcq with queue depth %d\n",
+	dev_err(hba->dev, "%s: activate tcq with queue depth %d\n",
 			__func__, lun_qdepth);
 	scsi_change_queue_depth(sdev, lun_qdepth);
+	if (fixable_qdepth)
+		ufs_fix_qdepth_device(hba, sdev);
 }
 
 /*
@@ -5611,7 +5643,9 @@ static int ufshcd_change_queue_depth(struct scsi_device *sdev, int depth)
 
 	if (depth > hba->nutrs)
 		depth = hba->nutrs;
-	return scsi_change_queue_depth(sdev, depth);
+
+	scsi_change_queue_depth(sdev, depth);
+	return ufs_fix_qdepth_device(hba, sdev);
 }
 
 /**
@@ -6717,8 +6751,8 @@ static void ufshcd_rls_handler(struct work_struct *work)
 	u32 mode;
 
 	hba = container_of(work, struct ufs_hba, rls_work);
-	ufshcd_scsi_block_requests(hba);
 	pm_runtime_get_sync(hba->dev);
+	ufshcd_scsi_block_requests(hba);
 	down_write(&hba->lock);
 	ret = ufshcd_wait_for_doorbell_clr(hba, U64_MAX);
 	if (ret) {
@@ -8634,7 +8668,7 @@ static int ufshcd_query_ioctl(struct ufs_hba *hba, u8 lun, void __user *buffer)
 		switch (ioctl_data->idn) {
 		case QUERY_ATTR_IDN_BOOT_LU_EN:
 			index = 0;
-			if (att > QUERY_ATTR_IDN_BOOT_LU_EN_MAX) {
+			if (!att || att > QUERY_ATTR_IDN_BOOT_LU_EN_MAX) {
 				dev_err(hba->dev,
 					"%s: Illegal ufs query ioctl data, opcode 0x%x, idn 0x%x, att 0x%x\n",
 					__func__, ioctl_data->opcode,
@@ -8878,6 +8912,11 @@ static int ufshcd_config_vreg(struct device *dev,
 	name = vreg->name;
 
 	if (regulator_count_voltages(reg) > 0) {
+		uA_load = on ? vreg->max_uA : 0;
+		ret = ufshcd_config_vreg_load(dev, vreg, uA_load);
+		if (ret)
+			goto out;
+
 		min_uV = on ? vreg->min_uV : 0;
 		ret = regulator_set_voltage(reg, min_uV, vreg->max_uV);
 		if (ret) {
@@ -8885,11 +8924,6 @@ static int ufshcd_config_vreg(struct device *dev,
 					__func__, name, ret);
 			goto out;
 		}
-
-		uA_load = on ? vreg->max_uA : 0;
-		ret = ufshcd_config_vreg_load(dev, vreg, uA_load);
-		if (ret)
-			goto out;
 	}
 out:
 	return ret;
@@ -10875,7 +10909,15 @@ static int ufshcd_devfreq_scale(struct ufs_hba *hba, bool scale_up)
 	 * racing during clock frequency scaling sequence.
 	 */
 	if (ufshcd_is_auto_hibern8_supported(hba)) {
+		/*
+		 * Scaling prepare acquires the rw_sem: lock
+		 * h8 may sleep in case of errors.
+		 * e.g. link_recovery. Hence, release the rw_sem
+		 * before hibern8.
+		 */
+		up_write(&hba->lock);
 		ret = ufshcd_uic_hibern8_enter(hba);
+		down_write(&hba->lock);
 		/* link will be bad state so no need to scale_up_gear */
 		if (ret)
 			goto clk_scaling_unprepare;
@@ -11005,6 +11047,8 @@ static ssize_t ufshcd_clkscale_enable_store(struct device *dev,
 	cancel_work_sync(&hba->clk_scaling.resume_work);
 
 	hba->clk_scaling.is_allowed = value;
+
+	flush_work(&hba->eh_work);
 
 	if (value) {
 		ufshcd_resume_clkscaling(hba);
